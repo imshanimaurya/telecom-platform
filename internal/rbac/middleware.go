@@ -8,24 +8,31 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// RequireWorkspace enforces the multi-tenant invariant: workspace_id must exist in context.
-// This does not validate membership; that belongs to the authorization layer once persistence exists.
+/*
+RequireWorkspace enforces the multi-tenant invariant.
+workspace_id MUST exist in context for all protected routes.
+*/
 func RequireWorkspace() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		wid, err := auth.WorkspaceID(c.Request.Context())
+		wid, err := auth.WorkspaceIDFromGin(c)
 		if err != nil || wid == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "workspace_id required"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": "workspace_id required",
+			})
 			return
 		}
 		c.Next()
 	}
 }
 
-// RequireAnyRole allows access if the caller has any of the provided roles.
-// Rules:
-// - super_admin bypasses all checks
-// - network_operator is a hidden role, and will be denied unless explicitly allowed
-// - workspace isolation is enforced via RequireWorkspace (use it in the chain)
+/*
+RequireAnyRole allows access if caller has ANY allowed role.
+
+Rules:
+- super_admin bypasses all checks
+- hidden roles are denied unless explicitly allowed
+- workspace isolation enforced internally (fail-safe)
+*/
 func RequireAnyRole(allowed ...string) gin.HandlerFunc {
 	allowedSet := make(map[string]struct{}, len(allowed))
 	for _, r := range allowed {
@@ -33,30 +40,47 @@ func RequireAnyRole(allowed ...string) gin.HandlerFunc {
 	}
 
 	return func(c *gin.Context) {
-		role, err := auth.Role(c.Request.Context())
-		if err != nil || role == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "role required"})
+		// Always enforce workspace
+		wid, err := auth.WorkspaceIDFromGin(c)
+		if err != nil || wid == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": "workspace_id required",
+			})
 			return
 		}
 
-		// super_admin bypasses all
+		role, err := auth.RoleFromGin(c)
+		if err != nil || role == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+				"error": "role required",
+			})
+			return
+		}
+
+		// Super admin bypass
 		if IsSuperAdmin(role) {
 			c.Next()
 			return
 		}
 
-		// hidden roles are opt-in only
+		// Role must be explicitly allowed
+		if _, ok := allowedSet[role]; !ok {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": "forbidden",
+			})
+			return
+		}
+
+		// Hidden roles must be explicitly listed
 		if IsHiddenRole(role) {
 			if _, ok := allowedSet[role]; !ok {
-				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error": "forbidden",
+				})
 				return
 			}
 		}
 
-		if _, ok := allowedSet[role]; !ok {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-			return
-		}
 		c.Next()
 	}
 }
