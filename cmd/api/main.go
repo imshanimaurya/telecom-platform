@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,48 +17,62 @@ import (
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	ctx := context.Background()
+	// Root context that cancels on shutdown
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	cfg, err := config.Load()
 	if err != nil {
-		panic(err)
+		slog.Error("config load failed", "err", err)
+		os.Exit(1)
 	}
 
 	log := logger.New(cfg.App.Env)
 	slog.SetDefault(log)
 
+	if cfg.App.Env == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
 	authManager, err := auth.NewManager(cfg.Auth)
 	if err != nil {
 		log.Error("auth init failed", "err", err)
-		panic(err)
+		os.Exit(1)
 	}
 
-	db, err := utils.OpenPostgres(ctx, "pgx", cfg.PostgresDSN(), utils.PostgresPoolConfig{})
+	db, err := utils.OpenPostgres(rootCtx, "pgx", cfg.PostgresDSN(), utils.PostgresPoolConfig{})
 	if err != nil {
 		log.Error("postgres init failed", "err", err)
-		panic(err)
+		os.Exit(1)
 	}
-	defer func() { _ = db.Close() }()
+	defer db.Close()
 
-	rdb, err := utils.OpenRedis(ctx, utils.RedisConfig{Addr: cfg.RedisAddr()})
+	rdb, err := utils.OpenRedis(rootCtx, utils.RedisConfig{Addr: cfg.RedisAddr()})
 	if err != nil {
 		log.Error("redis init failed", "err", err)
-		panic(err)
+		os.Exit(1)
 	}
-	defer func() { _ = rdb.Close() }()
+	defer rdb.Close()
 
-	_ = db   // reserved for dependency injection wiring
-	_ = rdb // reserved for dependency injection wiring
-
+	// Gin router
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(logger.Middleware(log))
 
-	registerRoutes(r, auth.RequireAccessToken(authManager))
+	// Attach shared deps to context (no globals)
+	r.Use(func(c *gin.Context) {
+		c.Set("db", db)
+		c.Set("redis", rdb)
+		c.Next()
+	})
+
+	// Route groups
+	registerPublicRoutes(r) // webhooks, health
+	registerAuthRoutes(r, authManager)
+	registerProtectedRoutes(r, auth.RequireAccessToken(authManager))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr(),
@@ -70,25 +83,16 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	errCh := make(chan error, 1)
 	go func() {
 		log.Info("api listening", "addr", srv.Addr, "env", cfg.App.Env)
-		errCh <- srv.ListenAndServe()
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("http server failed", "err", err)
+			stop()
+		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case sig := <-stop:
-		log.Info("shutdown signal received", "signal", sig.String())
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("server stopped unexpectedly", "err", err)
-			panic(err)
-		}
-		log.Info("server stopped")
-	}
+	<-rootCtx.Done()
+	log.Info("shutdown initiated")
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -96,5 +100,6 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("http shutdown failed", "err", err)
 	}
+
 	_ = logger.ShutdownFlush(shutdownCtx, 2*time.Second)
 }
