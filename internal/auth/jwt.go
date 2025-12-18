@@ -11,25 +11,25 @@ import (
 )
 
 type Manager struct {
-	secret        []byte
-	issuer        string
-	audience      string
-	accessTTL     time.Duration
-	refreshTTL    time.Duration
+	secret     []byte
+	issuer     string
+	audience   string
+	accessTTL  time.Duration
+	refreshTTL time.Duration
 }
 
 func NewManager(cfg config.AuthConfig) (*Manager, error) {
 	if cfg.JWTSecret == "" {
 		return nil, errors.New("JWT_SECRET is required")
 	}
-	m := &Manager{
+
+	return &Manager{
 		secret:     []byte(cfg.JWTSecret),
 		issuer:     cfg.JWTIssuer,
 		audience:   cfg.JWTAudience,
 		accessTTL:  cfg.AccessTokenTTL,
 		refreshTTL: cfg.RefreshTokenTTL,
-	}
-	return m, nil
+	}, nil
 }
 
 type TokenPair struct {
@@ -37,20 +37,43 @@ type TokenPair struct {
 	RefreshToken string
 }
 
+/* ===================== ISSUE TOKENS ===================== */
+
 func (m *Manager) IssuePair(now time.Time, userID, workspaceID, role string) (TokenPair, error) {
-	access, err := m.issue(now, TokenTypeAccess, userID, workspaceID, role, m.accessTTL)
+	access, err := m.issue(
+		now,
+		TokenTypeAccess,
+		userID,
+		workspaceID,
+		role,
+		m.accessTTL,
+	)
 	if err != nil {
 		return TokenPair{}, err
 	}
-	refresh, err := m.issue(now, TokenTypeRefresh, userID, workspaceID, role, m.refreshTTL)
+
+	refresh, err := m.issue(
+		now,
+		TokenTypeRefresh,
+		userID,
+		workspaceID,
+		"", // refresh tokens DO NOT carry role
+		m.refreshTTL,
+	)
 	if err != nil {
 		return TokenPair{}, err
 	}
-	return TokenPair{AccessToken: access, RefreshToken: refresh}, nil
+
+	return TokenPair{
+		AccessToken:  access,
+		RefreshToken: refresh,
+	}, nil
 }
 
+/* ===================== VERIFY TOKEN ===================== */
+
 func (m *Manager) Verify(tokenString string, expected TokenType, now time.Time) (Claims, error) {
-	claims := Claims{}
+	var claims Claims
 
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
@@ -58,64 +81,34 @@ func (m *Manager) Verify(tokenString string, expected TokenType, now time.Time) 
 		jwt.WithExpirationRequired(),
 	)
 
-	tok, err := parser.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (any, error) {
+	_, err := parser.ParseWithClaims(tokenString, &claims, func(token *jwt.Token) (any, error) {
 		return m.secret, nil
 	})
 	if err != nil {
 		return Claims{}, err
 	}
-	if !tok.Valid {
-		return Claims{}, errors.New("invalid token")
-	}
 
-	// Standard claim validation.
-	// We validate RegisteredClaims using jwt/v5's validator.
-	validator := jwt.NewValidator(
+	// Build ONE validator
+	opts := []jwt.ValidatorOption{
 		jwt.WithTimeFunc(func() time.Time { return now }),
+		jwt.WithLeeway(30 * time.Second), // clock skew tolerance
 		jwt.WithIssuedAt(),
 		jwt.WithExpirationRequired(),
-	)
+	}
+
 	if m.issuer != "" {
-		validator = jwt.NewValidator(
-			jwt.WithTimeFunc(func() time.Time { return now }),
-			jwt.WithIssuedAt(),
-			jwt.WithExpirationRequired(),
-			jwt.WithIssuer(m.issuer),
-		)
+		opts = append(opts, jwt.WithIssuer(m.issuer))
 	}
 	if m.audience != "" {
-		// If issuer is also set, include it in the same validator.
-		opts := []any{
-			jwt.WithTimeFunc(func() time.Time { return now }),
-			jwt.WithIssuedAt(),
-			jwt.WithExpirationRequired(),
-			jwt.WithAudience(m.audience),
-		}
-		if m.issuer != "" {
-			opts = append(opts, jwt.WithIssuer(m.issuer))
-		}
-		// Rebuild validator using the options slice.
-		validator = jwt.NewValidator(
-			jwt.WithTimeFunc(func() time.Time { return now }),
-			jwt.WithIssuedAt(),
-			jwt.WithExpirationRequired(),
-			jwt.WithAudience(m.audience),
-		)
-		if m.issuer != "" {
-			validator = jwt.NewValidator(
-				jwt.WithTimeFunc(func() time.Time { return now }),
-				jwt.WithIssuedAt(),
-				jwt.WithExpirationRequired(),
-				jwt.WithAudience(m.audience),
-				jwt.WithIssuer(m.issuer),
-			)
-		}
-		_ = opts
+		opts = append(opts, jwt.WithAudience(m.audience))
 	}
+
+	validator := jwt.NewValidator(opts...)
 	if err := validator.Validate(claims.RegisteredClaims); err != nil {
 		return Claims{}, err
 	}
 
+	// Custom claims validation
 	if claims.TokenType != expected {
 		return Claims{}, errors.New("token_type mismatch")
 	}
@@ -125,15 +118,28 @@ func (m *Manager) Verify(tokenString string, expected TokenType, now time.Time) 
 	if claims.WorkspaceID == "" {
 		return Claims{}, errors.New("workspace_id missing")
 	}
-	if claims.Role == "" {
-		return Claims{}, errors.New("role missing")
+
+	// Role is required ONLY for access tokens
+	if expected == TokenTypeAccess && claims.Role == "" {
+		return Claims{}, errors.New("role missing in access token")
 	}
 
 	return claims, nil
 }
 
-func (m *Manager) issue(now time.Time, tokenType TokenType, userID, workspaceID, role string, ttl time.Duration) (string, error) {
+/* ===================== INTERNAL ISSUE ===================== */
+
+func (m *Manager) issue(
+	now time.Time,
+	tokenType TokenType,
+	userID,
+	workspaceID,
+	role string,
+	ttl time.Duration,
+) (string, error) {
+
 	jti := uuid.NewString()
+
 	claims := Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    m.issuer,
